@@ -1,0 +1,7 @@
+{
+  "name": "MediScan Pro",
+  "description": "Intelligent medical document scanner and summarizer with automatic categorization.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
