@@ -1,14 +1,31 @@
+export interface PageAsset {
+  data: string; // Base64
+  mimeType: string;
+}
+
+export interface ExtractedGraphic {
+  id: string;
+  base64: string; // The cropped image
+  label: string;
+  box: number[]; // [ymin, xmin, ymax, xmax] 0-1000
+  selected: boolean;
+  pageIndex: number; // Which page this graphic belongs to (0-based)
+}
+
 export interface ProcessedDocument {
   id: string;
   timestamp: number;
-  originalImage?: string; // Base64
+  pages: PageAsset[]; // Array of assets
   fileName?: string;
+  detectedTitle?: string;
   
   // Content Fields
   category?: string;
   summary: string;
   detailedContent: string; // The raw full text
-  graphicsDescription: string;
+  
+  // Detected Graphics
+  graphics?: ExtractedGraphic[];
   
   // Status
   status: 'processing' | 'reviewing' | 'completed' | 'error';
@@ -17,13 +34,11 @@ export interface ProcessedDocument {
   // Review Data (temporary storage during review)
   reviewData?: {
     detectedCategories: string[];
-    detectedGraphics: string;
-    hasGraphics: boolean;
+    potentialGraphics?: ExtractedGraphic[]; // Graphics waiting for approval
   };
 }
 
 export interface AnalysisResponse {
   summary: string;
   detailedContent: string;
-  graphicsDescription: string;
 }

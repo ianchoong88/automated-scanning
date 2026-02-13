@@ -1,31 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import Scanner from './components/Scanner';
 import ResultsViewer from './components/ResultsViewer';
-import MasterDocModal from './components/MasterDocModal';
 import { analyzeDocumentStream } from './services/geminiService';
-import { ProcessedDocument } from './types';
-import { parseMarkdownSections } from './utils';
+import { ProcessedDocument, ExtractedGraphic, PageAsset } from './types';
+import { parseMarkdownSections, cropImageFromCoordinates } from './utils';
 
 function App() {
   const [activeDoc, setActiveDoc] = useState<ProcessedDocument | null>(null);
   const [history, setHistory] = useState<ProcessedDocument[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
-  
-  // Master Doc State
-  const [masterDocContent, setMasterDocContent] = useState<string>("");
-  const [isMasterDocOpen, setIsMasterDocOpen] = useState(false);
-
-  // Load Master Doc from local storage on mount
-  useEffect(() => {
-    const savedDoc = localStorage.getItem('mediScan_masterDoc');
-    if (savedDoc) setMasterDocContent(savedDoc);
-  }, []);
-
-  const updateMasterDoc = (newContent: string) => {
-    const updated = masterDocContent + "\n\n---\n\n" + newContent;
-    setMasterDocContent(updated);
-    localStorage.setItem('mediScan_masterDoc', updated);
-  };
 
   const handleScanStart = () => {
     const tempDoc: ProcessedDocument = {
@@ -34,12 +17,12 @@ function App() {
       status: 'processing',
       summary: '',
       detailedContent: '',
-      graphicsDescription: '',
+      pages: [],
     };
     setActiveDoc(tempDoc);
   };
 
-  const handleScanComplete = async (base64: string, mimeType: string, fileName?: string) => {
+  const handleScanComplete = async (pages: PageAsset[], fileName?: string) => {
     const docId = Date.now().toString();
     const newDoc: ProcessedDocument = {
       id: docId,
@@ -47,14 +30,14 @@ function App() {
       status: 'processing',
       summary: '',
       detailedContent: '',
-      graphicsDescription: '',
+      pages: pages, 
       fileName: fileName || `Scan ${new Date().toLocaleTimeString()}`
     };
 
     setActiveDoc(newDoc);
 
     try {
-      const stream = analyzeDocumentStream(base64, mimeType);
+      const stream = analyzeDocumentStream(pages);
       let accumulatedText = "";
 
       for await (const chunk of stream) {
@@ -65,33 +48,78 @@ function App() {
         });
       }
 
-      // Post-Processing: Parse sections for review
+      // Post-Processing
       const parsed = parseMarkdownSections(accumulatedText);
-      
       const categories = parsed.category.split(',').map(c => c.trim()).filter(Boolean);
-      const hasGraphics = parsed.graphics.length > 5 && !parsed.graphics.toLowerCase().includes('none');
+      
+      // Parse Graphics JSON
+      let detectedGraphics: any[] = [];
+      try {
+        detectedGraphics = JSON.parse(parsed.graphicsJson);
+      } catch (e) {
+        console.warn("Failed to parse graphics JSON", e);
+      }
 
-      // If we need review (multiple categories OR graphics detected), pause state
-      if (categories.length > 1 || hasGraphics) {
+      // Crop Images if graphics detected
+      const potentialGraphics: ExtractedGraphic[] = [];
+      if (detectedGraphics.length > 0) {
+        showNotification(`Detected ${detectedGraphics.length} graphics. Processing...`);
+        
+        await Promise.all(detectedGraphics.map(async (g: any, idx: number) => {
+          if (g.box_2d && Array.isArray(g.box_2d)) {
+             try {
+               // Determine which page to crop from
+               const pageIndex = typeof g.page_index === 'number' ? g.page_index : 0;
+               const sourcePage = pages[pageIndex] || pages[0]; 
+               
+               if (!sourcePage) return;
+               
+               // SKIP cropping if it is a PDF
+               if (sourcePage.mimeType === 'application/pdf') {
+                  // We can't crop PDFs client-side easily without a library. 
+                  // We just ignore the visual graphic extraction but keep the text analysis.
+                  return;
+               }
+
+               const croppedBase64 = await cropImageFromCoordinates(sourcePage.data, g.box_2d, sourcePage.mimeType);
+               if (croppedBase64) {
+                 potentialGraphics.push({
+                   id: `graphic-${idx}`,
+                   base64: croppedBase64,
+                   label: g.label || `Graphic ${idx + 1}`,
+                   box: g.box_2d,
+                   pageIndex: pageIndex,
+                   selected: true 
+                 });
+               }
+             } catch (err) {
+               console.error("Failed to crop graphic", err);
+             }
+          }
+        }));
+      }
+      
+      const needsReview = categories.length > 1 || potentialGraphics.length > 0;
+
+      if (needsReview) {
         setActiveDoc(prev => {
           if (prev?.id !== docId) return prev;
           return {
             ...prev,
             status: 'reviewing',
-            category: categories[0], // Default to first
+            category: categories[0] || 'General', 
+            detectedTitle: parsed.title,
             summary: parsed.summary,
-            graphicsDescription: parsed.graphics,
+            detailedContent: parsed.content,
             reviewData: {
               detectedCategories: categories,
-              detectedGraphics: parsed.graphics,
-              hasGraphics
+              potentialGraphics: potentialGraphics
             }
           };
         });
-        showNotification("Review required: Please confirm details.");
+        showNotification("Review required: Confirm details.");
       } else {
-        // Auto-complete
-        finishDocument(docId, parsed.category, parsed.graphics, accumulatedText);
+        finishDocument(docId, parsed.category, parsed.title, parsed.content, parsed.summary, []);
       }
 
     } catch (error: any) {
@@ -103,45 +131,44 @@ function App() {
     }
   };
 
-  const finishDocument = (docId: string, finalCategory: string, finalGraphics: string, fullText: string) => {
+  const finishDocument = (
+    docId: string, 
+    finalCategory: string, 
+    title: string, 
+    content: string, 
+    summary: string, 
+    graphics: ExtractedGraphic[]
+  ) => {
     setActiveDoc(prev => {
       if (prev?.id !== docId) return prev;
-
-      // Construct final report text
-      const finalReport = `
-# Category: ${finalCategory}
-${fullText.replace(/# Category[\s\S]*?(?=# Executive Summary)/, '')}
-      `.trim();
-
-      // If user kept graphics, ensure they are in the text. If rejected (passed as empty string), remove section.
-      let cleanedText = finalReport;
-      if (!finalGraphics) {
-        // Remove Graphics section via regex if it exists
-        cleanedText = cleanedText.replace(/# Graphics & Data[\s\S]*?(?=# Extracted Content)/, '');
-      }
 
       const completedDoc: ProcessedDocument = {
         ...prev,
         status: 'completed',
         category: finalCategory,
-        detailedContent: cleanedText
+        detectedTitle: title,
+        summary: summary,
+        detailedContent: content,
+        graphics: graphics
       };
 
       setHistory(old => [completedDoc, ...old]);
-      updateMasterDoc(cleanedText);
       return completedDoc;
     });
     
-    showNotification("Synced to Master Google Doc.");
+    showNotification("Analysis Complete.");
   };
 
-  const handleReviewDecision = (keepGraphics: boolean, selectedCategory: string) => {
+  const handleReviewDecision = (selectedCategory: string, selectedGraphics: ExtractedGraphic[]) => {
     if (!activeDoc || activeDoc.status !== 'reviewing') return;
-    
-    // If keepGraphics is false, we pass empty string for graphics to signal removal
-    const graphicsToKeep = keepGraphics ? activeDoc.reviewData?.detectedGraphics || "" : "";
-    
-    finishDocument(activeDoc.id, selectedCategory, graphicsToKeep, activeDoc.detailedContent);
+    finishDocument(
+      activeDoc.id, 
+      selectedCategory, 
+      activeDoc.detectedTitle || "Document", 
+      activeDoc.detailedContent, 
+      activeDoc.summary,
+      selectedGraphics
+    );
   };
 
   const handleScanError = (msg: string) => {
@@ -156,7 +183,6 @@ ${fullText.replace(/# Category[\s\S]*?(?=# Executive Summary)/, '')}
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col md:flex-row">
-      {/* Sidebar History */}
       <div className="hidden md:flex flex-col w-64 bg-white border-r border-slate-200 h-screen sticky top-0 overflow-hidden">
         <div className="p-5 border-b border-slate-100">
           <h1 className="text-xl font-bold text-teal-800 flex items-center gap-2">
@@ -165,49 +191,33 @@ ${fullText.replace(/# Category[\s\S]*?(?=# Executive Summary)/, '')}
             </svg>
             MediScan Pro
           </h1>
-          <p className="text-xs text-slate-500 mt-1">Version 3.2.0</p>
+          <p className="text-xs text-slate-500 mt-1">Version 6.0.0</p>
         </div>
         
-        {/* Master Doc Link */}
-        <div className="p-4 bg-blue-50 border-b border-blue-100">
-          <button 
-            onClick={() => setIsMasterDocOpen(true)}
-            className="flex items-center gap-3 w-full text-left text-blue-700 hover:text-blue-800 transition-colors"
-          >
-            <div className="p-2 bg-blue-100 rounded-lg">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5">
-                <path d="M5.625 1.5c-1.036 0-1.875.84-1.875 1.875v17.25c0 1.035.84 1.875 1.875 1.875h12.75c1.035 0 1.875-.84 1.875-1.875V12.75A3.75 3.75 0 0 0 16.5 9h-1.875a1.875 1.875 0 0 1-1.875-1.875V5.25A3.75 3.75 0 0 0 9 1.5H5.625Z" />
-                <path d="M12.971 1.816A5.23 5.23 0 0 1 14.25 5.25v1.875c0 .207.168.375.375.375H16.5a5.23 5.23 0 0 1 3.434 1.279 9.768 9.768 0 0 0-6.963-6.963Z" />
-              </svg>
-            </div>
-            <div>
-              <div className="text-sm font-semibold">Master Google Doc</div>
-              <div className="text-xs opacity-70">View aggregated report</div>
-            </div>
-          </button>
-        </div>
-
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
-          <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 px-2">Recent Scans</div>
+          <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 px-2">History</div>
           {history.map(doc => (
             <button
               key={doc.id}
               onClick={() => setActiveDoc(doc)}
               className={`w-full text-left p-3 rounded-lg text-sm transition-colors ${activeDoc?.id === doc.id ? 'bg-teal-50 text-teal-900 border border-teal-100' : 'hover:bg-slate-50 text-slate-600'}`}
             >
-              <div className="font-medium truncate">{doc.fileName || `Scan ${new Date(doc.timestamp).toLocaleTimeString()}`}</div>
+              <div className="font-medium truncate">{doc.detectedTitle || doc.fileName}</div>
               <div className="text-xs text-slate-400 mt-1 flex justify-between">
                 <span>{doc.category || 'General'}</span>
                 <span>{new Date(doc.timestamp).toLocaleDateString()}</span>
               </div>
             </button>
           ))}
+          {history.length === 0 && (
+            <div className="text-center p-4 text-slate-400 text-xs italic">
+              No scans yet.
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Main Content */}
       <main className="flex-1 flex flex-col min-h-screen relative">
-        {/* Notification Toast */}
         {notification && (
           <div className="fixed top-4 right-4 z-50 bg-slate-800 text-white px-4 py-3 rounded-lg shadow-lg text-sm animate-fade-in-down flex items-center gap-2">
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4 text-green-400">
@@ -241,14 +251,6 @@ ${fullText.replace(/# Category[\s\S]*?(?=# Executive Summary)/, '')}
           )}
         </div>
       </main>
-
-      {/* Master Doc Modal */}
-      {isMasterDocOpen && (
-        <MasterDocModal 
-          content={masterDocContent} 
-          onClose={() => setIsMasterDocOpen(false)} 
-        />
-      )}
     </div>
   );
 }

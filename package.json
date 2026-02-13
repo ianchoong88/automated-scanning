@@ -11,7 +11,9 @@
   "dependencies": {
     "react": "^19.2.4",
     "@google/genai": "^1.41.0",
-    "react-dom": "^19.2.4"
+    "react-dom": "^19.2.4",
+    "docx": "8.5.0",
+    "file-saver": "2.0.5"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
